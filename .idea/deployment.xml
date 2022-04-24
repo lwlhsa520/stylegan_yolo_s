@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" autoUpload="Always" serverName="bdbd@172.18.13.75:22" filePermissions="511" folderPermissions="511" remoteFilesAllowedToDisappearOnAutoupload="false">
+    <serverData>
+      <paths name="bdbd@172.18.13.75:22">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/bdbd/coding/stylegan_yolo_s" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="bdbd@172.18.13.75:22 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/bdbd/coding/stylegan_yolo_s" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="lwlhsa@172.18.13.74:22 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home1/lwlhsa/coding/stylegan_yolo_s" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+    </serverData>
+    <option name="myAutoUpload" value="ALWAYS" />
+  </component>
+</project>

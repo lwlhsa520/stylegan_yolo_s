@@ -8,12 +8,28 @@
 
 import numpy as np
 import torch
+from torchvision import transforms
+
 from torch_utils import misc
 from torch_utils import persistence
 from torch_utils.ops import conv2d_resample
 from torch_utils.ops import upfirdn2d
 from torch_utils.ops import bias_act
 from torch_utils.ops import fma
+
+#----------------------------------------------------------------------------
+from utils.general import xywh2xyxy, clip_coords, xyxy2xywh
+
+
+def calc_mean_std(feat, eps=1e-5):
+    # eps is a small value added to the variance to avoid divide-by-zero.
+    size = feat.size()
+    assert (len(size) == 4)
+    N, C = size[:2]
+    feat_var = feat.view(N, C, -1).var(dim=2) + eps
+    feat_std = feat_var.sqrt().view(N, C, 1, 1)
+    feat_mean = feat.view(N, C, -1).mean(dim=2).view(N, C, 1, 1)
+    return feat_mean, feat_std
 
 #----------------------------------------------------------------------------
 
@@ -29,6 +45,7 @@ def modulated_conv2d(
     weight,                     # Weight tensor of shape [out_channels, in_channels, kernel_height, kernel_width].
     styles,                     # Modulation coefficients of shape [batch_size, in_channels].
     noise           = None,     # Optional noise tensor to add to the output activations.
+    location        = None,
     up              = 1,        # Integer upsampling factor.
     down            = 1,        # Integer downsampling factor.
     padding         = 0,        # Padding with respect to the upsampled image.
@@ -69,18 +86,24 @@ def modulated_conv2d(
             x = x * dcoefs.to(x.dtype).reshape(batch_size, -1, 1, 1)
         elif noise is not None:
             x = x.add_(noise.to(x.dtype))
-        return x
 
-    # Execute as one fused op using grouped convolution.
-    with misc.suppress_tracer_warnings(): # this value will be treated as a constant
-        batch_size = int(batch_size)
-    misc.assert_shape(x, [batch_size, in_channels, None, None])
-    x = x.reshape(1, -1, *x.shape[2:])
-    w = w.reshape(-1, in_channels, kh, kw)
-    x = conv2d_resample.conv2d_resample(x=x, w=w.to(x.dtype), f=resample_filter, up=up, down=down, padding=padding, groups=batch_size, flip_weight=flip_weight)
-    x = x.reshape(batch_size, -1, *x.shape[2:])
-    if noise is not None:
-        x = x.add_(noise)
+    else:
+        # Execute as one fused op using grouped convolution.
+        with misc.suppress_tracer_warnings(): # this value will be treated as a constant
+            batch_size = int(batch_size)
+        misc.assert_shape(x, [batch_size, in_channels, None, None])
+        x = x.reshape(1, -1, *x.shape[2:])
+        w = w.reshape(-1, in_channels, kh, kw)
+        x = conv2d_resample.conv2d_resample(x=x, w=w.to(x.dtype), f=resample_filter, up=up, down=down, padding=padding, groups=batch_size, flip_weight=flip_weight)
+        x = x.reshape(batch_size, -1, *x.shape[2:])
+        if noise is not None:
+            x = x.add_(noise)
+
+    # print(location.shape, x.shape)
+    loc_mean, loc_std = location.reshape(x.shape[0], -1, 2).unbind(-1)
+    # print(loc_mean.shape, loc_std.shape)
+    x = x * loc_std.to(x.dtype).reshape(batch_size, -1, 1, 1) + loc_mean.to(x.dtype).reshape(batch_size, -1, 1, 1)
+
     return x
 
 #----------------------------------------------------------------------------
@@ -169,6 +192,50 @@ class Conv2dLayer(torch.nn.Module):
         return x
 
 #----------------------------------------------------------------------------
+@persistence.persistent_class
+class CEncoder(torch.nn.Module):
+    def __init__(self,
+                 in_dim,  # Input latent (Z) dimensionality, 0 = no latent.
+                 out_dim,  # Intermediate latent (W) dimensionality.
+                 num_layers=3,  # Number of mapping layers.
+                 embed_features=None,  # Label embedding dimensionality, None = same as w_dim.
+                 layer_features=None,  # Number of intermediate features in the mapping layers, None = same as w_dim.
+                 activation='lrelu',  # Activation function: 'relu', 'lrelu', etc.
+                 lr_multiplier=0.01,  # Learning rate multiplier for the mapping layers.
+                 w_avg_beta=0.995,  # Decay for tracking the moving average of W during training, None = do not track.
+                 ):
+
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.num_layers = num_layers
+        self.w_avg_beta = w_avg_beta
+
+        if embed_features is None:
+            embed_features = out_dim
+        if layer_features is None:
+            layer_features = out_dim
+        features_list = [in_dim * 4] + [layer_features] * (num_layers - 1) + [out_dim]
+
+        for idx in range(num_layers):
+            in_features = features_list[idx]
+            out_features = features_list[idx + 1]
+            layer = FullyConnectedLayer(in_features, out_features, activation=activation, lr_multiplier=lr_multiplier)
+            setattr(self, f'fc{idx}', layer)
+
+    def forward(self, bbox):
+        # Embed, normalize, and concat inputs.
+        misc.assert_shape(bbox, [None, self.in_dim, 5])
+        x = bbox[:, :, 1:].reshape(-1, self.in_dim * 4)
+        # x = x.to(torch.float32)
+        # Main layers.
+        for idx in range(self.num_layers):
+            layer = getattr(self, f'fc{idx}')
+            x = layer(x)
+
+        return x
+
+
 
 @persistence.persistent_class
 class MappingNetwork(torch.nn.Module):
@@ -247,6 +314,7 @@ class SynthesisLayer(torch.nn.Module):
         out_channels,                   # Number of output channels.
         w_dim,                          # Intermediate latent (W) dimensionality.
         resolution,                     # Resolution of this layer.
+        bbox_max        = 256,
         kernel_size     = 3,            # Convolution kernel size.
         up              = 1,            # Integer upsampling factor.
         use_noise       = True,         # Enable noise input?
@@ -258,6 +326,7 @@ class SynthesisLayer(torch.nn.Module):
         super().__init__()
         self.resolution = resolution
         self.up = up
+        self.in_channels = in_channels
         self.use_noise = use_noise
         self.activation = activation
         self.conv_clamp = conv_clamp
@@ -266,6 +335,7 @@ class SynthesisLayer(torch.nn.Module):
         self.act_gain = bias_act.activation_funcs[activation].def_gain
 
         self.affine = FullyConnectedLayer(w_dim, in_channels, bias_init=1)
+        self.loc_affine = FullyConnectedLayer(bbox_max * 4, out_channels * 2, bias_init=1)
         memory_format = torch.channels_last if channels_last else torch.contiguous_format
         self.weight = torch.nn.Parameter(torch.randn([out_channels, in_channels, kernel_size, kernel_size]).to(memory_format=memory_format))
         if use_noise:
@@ -273,11 +343,19 @@ class SynthesisLayer(torch.nn.Module):
             self.noise_strength = torch.nn.Parameter(torch.zeros([]))
         self.bias = torch.nn.Parameter(torch.zeros([out_channels]))
 
-    def forward(self, x, w, noise_mode='random', fused_modconv=True, gain=1):
+    def forward(self, x, w, location, noise_mode='random', fused_modconv=True, gain=1):
         assert noise_mode in ['random', 'const', 'none']
         in_resolution = self.resolution // self.up
         misc.assert_shape(x, [None, self.weight.shape[1], in_resolution, in_resolution])
         styles = self.affine(w)
+
+        # add bbox infomations into x
+        # dtype = x.dtype
+        location = self.loc_affine(location)
+        # loc_mean, loc_std = location.reshape(x.shape[0], x.shape[1], 2).unbind(-1)
+        # while loc_mean.ndim < 4:
+        #     loc_mean, loc_std = loc_mean.unsqueeze(-1), loc_std.unsqueeze(-1)
+        # x = (x * loc_std + loc_mean).to(dtype=dtype)
 
         noise = None
         if self.use_noise and noise_mode == 'random':
@@ -286,7 +364,7 @@ class SynthesisLayer(torch.nn.Module):
             noise = self.noise_const * self.noise_strength
 
         flip_weight = (self.up == 1) # slightly faster
-        x = modulated_conv2d(x=x, weight=self.weight, styles=styles, noise=noise, up=self.up,
+        x = modulated_conv2d(x=x, weight=self.weight, styles=styles, noise=noise, location=location, up=self.up,
             padding=self.padding, resample_filter=self.resample_filter, flip_weight=flip_weight, fused_modconv=fused_modconv)
 
         act_gain = self.act_gain * gain
@@ -298,18 +376,27 @@ class SynthesisLayer(torch.nn.Module):
 
 @persistence.persistent_class
 class ToRGBLayer(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, w_dim, kernel_size=1, conv_clamp=None, channels_last=False):
+    def __init__(self, in_channels, out_channels, w_dim, bbox_max=256, kernel_size=1, conv_clamp=None, channels_last=False):
         super().__init__()
         self.conv_clamp = conv_clamp
         self.affine = FullyConnectedLayer(w_dim, in_channels, bias_init=1)
+        self.loc_affine = FullyConnectedLayer(bbox_max * 4, out_channels * 2, bias_init=1)
         memory_format = torch.channels_last if channels_last else torch.contiguous_format
         self.weight = torch.nn.Parameter(torch.randn([out_channels, in_channels, kernel_size, kernel_size]).to(memory_format=memory_format))
         self.bias = torch.nn.Parameter(torch.zeros([out_channels]))
         self.weight_gain = 1 / np.sqrt(in_channels * (kernel_size ** 2))
 
-    def forward(self, x, w, fused_modconv=True):
+    def forward(self, x, w, location, fused_modconv=True):
+
+        # add bbox infomations into x
+        location = self.loc_affine(location)
+        # loc_mean, loc_std = location.reshape(x.shape[0], x.shape[1], 2).unbind(-1)
+        # while loc_mean.ndim < x.ndim:
+        #     loc_mean, loc_std = loc_mean.unsqueeze(-1), loc_std.unsqueeze(-1)
+        # x = x * loc_std + loc_mean
+
         styles = self.affine(w) * self.weight_gain
-        x = modulated_conv2d(x=x, weight=self.weight, styles=styles, demodulate=False, fused_modconv=fused_modconv)
+        x = modulated_conv2d(x=x, weight=self.weight, styles=styles, location=location, demodulate=False, fused_modconv=fused_modconv)
         x = bias_act.bias_act(x, self.bias.to(x.dtype), clamp=self.conv_clamp)
         return x
 
@@ -366,7 +453,7 @@ class SynthesisBlock(torch.nn.Module):
             self.skip = Conv2dLayer(in_channels, out_channels, kernel_size=1, bias=False, up=2,
                 resample_filter=resample_filter, channels_last=self.channels_last)
 
-    def forward(self, x, img, ws, force_fp32=False, fused_modconv=None, **layer_kwargs):
+    def forward(self, x, img, ws, location, force_fp32=False, fused_modconv=None, **layer_kwargs):
         misc.assert_shape(ws, [None, self.num_conv + self.num_torgb, self.w_dim])
         w_iter = iter(ws.unbind(dim=1))
         dtype = torch.float16 if self.use_fp16 and not force_fp32 else torch.float32
@@ -385,25 +472,25 @@ class SynthesisBlock(torch.nn.Module):
 
         # Main layers.
         if self.in_channels == 0:
-            x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
+            x = self.conv1(x, next(w_iter), location, fused_modconv=fused_modconv, **layer_kwargs)
         elif self.architecture == 'resnet':
             y = self.skip(x, gain=np.sqrt(0.5))
-            x = self.conv0(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
-            x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, gain=np.sqrt(0.5), **layer_kwargs)
+            x = self.conv0(x, next(w_iter), location, fused_modconv=fused_modconv, **layer_kwargs)
+            x = self.conv1(x, next(w_iter), location, fused_modconv=fused_modconv, gain=np.sqrt(0.5), **layer_kwargs)
             x = y.add_(x)
         else:
-            x = self.conv0(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
-            x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
+            x = self.conv0(x, next(w_iter), location, fused_modconv=fused_modconv, **layer_kwargs)
+            x = self.conv1(x, next(w_iter), location, fused_modconv=fused_modconv, **layer_kwargs)
 
         # ToRGB.
         if img is not None:
             misc.assert_shape(img, [None, self.img_channels, self.resolution // 2, self.resolution // 2])
             img = upfirdn2d.upsample2d(img, self.resample_filter)
         if self.is_last or self.architecture == 'skip':
-            y = self.torgb(x, next(w_iter), fused_modconv=fused_modconv)
+            y = self.torgb(x, next(w_iter), location, fused_modconv=fused_modconv)
             y = y.to(dtype=torch.float32, memory_format=torch.contiguous_format)
             img = img.add_(y) if img is not None else y
-
+        # print(x.dtype, dtype)
         assert x.dtype == dtype
         assert img is None or img.dtype == torch.float32
         return x, img
@@ -444,7 +531,7 @@ class SynthesisNetwork(torch.nn.Module):
                 self.num_ws += block.num_torgb
             setattr(self, f'b{res}', block)
 
-    def forward(self, ws, **block_kwargs):
+    def forward(self, ws, location, **block_kwargs):
         block_ws = []
         with torch.autograd.profiler.record_function('split_ws'):
             misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
@@ -458,7 +545,7 @@ class SynthesisNetwork(torch.nn.Module):
         x = img = None
         for res, cur_ws in zip(self.block_resolutions, block_ws):
             block = getattr(self, f'b{res}')
-            x, img = block(x, img, cur_ws, **block_kwargs)
+            x, img = block(x, img, cur_ws, location, **block_kwargs)
         return img
 
 #----------------------------------------------------------------------------
@@ -470,6 +557,7 @@ class Generator(torch.nn.Module):
         w_dim,                      # Intermediate latent (W) dimensionality.
         img_resolution,             # Output resolution.
         img_channels,               # Number of output color channels.
+        bbox_max            = 256,
         mapping_kwargs      = {},   # Arguments for MappingNetwork.
         synthesis_kwargs    = {},   # Arguments for SynthesisNetwork.
     ):
@@ -481,10 +569,12 @@ class Generator(torch.nn.Module):
         self.synthesis = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
         self.num_ws = self.synthesis.num_ws
         self.mapping = MappingNetwork(z_dim=z_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
+        self.conditions = CEncoder(in_dim=bbox_max, out_dim = bbox_max*4)
 
-    def forward(self, z, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
+    def forward(self, z, bbox, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
         ws = self.mapping(z, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-        img = self.synthesis(ws, **synthesis_kwargs)
+        location = self.conditions(bbox)
+        img = self.synthesis(ws, location, **synthesis_kwargs)
         return img
 
 #----------------------------------------------------------------------------
@@ -695,4 +785,101 @@ class Discriminator(torch.nn.Module):
         x = self.b4(x, img)
         return x
 
+
 #----------------------------------------------------------------------------
+
+
+@persistence.persistent_class
+class Discriminator2(torch.nn.Module):
+    def __init__(self,
+        img_resolution      = 32,       # Input resolution.
+        img_channels        = 1,        # Number of input color channels.
+        architecture        = 'resnet', # Architecture: 'orig', 'skip', 'resnet'.
+        channel_base        = 8192,    # Overall multiplier for the number of channels.
+        channel_max         = 512,      # Maximum number of channels in any layer.
+        num_fp16_res        = 0,        # Use FP16 for the N highest resolutions.
+        conv_clamp          = None,     # Clamp the output of convolution layers to +-X, None = disable clamping.
+        block_kwargs        = {},       # Arguments for DiscriminatorBlock.
+        epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
+    ):
+        super().__init__()
+        self.img_resolution = img_resolution
+        self.img_resolution_log2 = int(np.log2(img_resolution))
+        self.img_channels = img_channels
+        self.block_resolutions = [2 ** i for i in range(self.img_resolution_log2, 2, -1)]
+        channels_dict = {res: min(channel_base // res, channel_max) for res in self.block_resolutions + [4]}
+        fp16_resolution = max(2 ** (self.img_resolution_log2 + 1 - num_fp16_res), 8)
+
+        common_kwargs = dict(img_channels=img_channels, architecture=architecture, conv_clamp=conv_clamp)
+        cur_layer_idx = 0
+        for res in self.block_resolutions:
+            in_channels = channels_dict[res] if res < img_resolution else 0
+            tmp_channels = channels_dict[res]
+            out_channels = channels_dict[res // 2]
+            use_fp16 = (res >= fp16_resolution)
+            block = DiscriminatorBlock(in_channels, tmp_channels, out_channels, resolution=res,
+                first_layer_idx=cur_layer_idx, use_fp16=use_fp16, **block_kwargs, **common_kwargs)
+            setattr(self, f'b{res}', block)
+            cur_layer_idx += block.num_layers
+        self.b4 = DiscriminatorEpilogue(channels_dict[4], resolution=4, **epilogue_kwargs, **common_kwargs)
+
+    def forward(self, imgs, bboxs, compute_box=4, **block_kwargs):
+        device = imgs.device
+        B, C, W, H = imgs.shape
+        crop = []
+        for idx, (img, bbox) in enumerate(zip(imgs, bboxs)):
+            assert bbox.shape[0] >= compute_box
+            rnd_idx = np.random.choice(np.linspace(0, bbox.shape[0]-1, bbox.shape[0]), compute_box, replace=False)
+            for index, box in enumerate(bbox):
+                if index in rnd_idx:
+                    img_tmp = Resize(crop_one_box(box[2:], img), self.img_resolution)
+                    crop.append(img_tmp)
+
+        crop = torch.stack(crop).to(device)
+        x = None
+        for res in self.block_resolutions:
+            block = getattr(self, f'b{res}')
+            x, crop = block(x, crop, **block_kwargs)
+        x = self.b4(x, crop)
+        x = x.reshape(B, compute_box).mean(1, keepdim=True)
+        return x
+
+
+#----------------------------------------------------------------------------
+
+def Resize(img, size=32):
+    size = (size, size)
+    img = transforms.Resize(size)(img)
+    return img
+
+
+def crop_one_box(xyxy, im):
+    return im[:, int(xyxy[1]):int(xyxy[3]), int(xyxy[0]):int(xyxy[2])]
+
+
+if __name__ == "__main__":
+    img = torch.randn([8, 1, 256, 256])
+    label = [[0,  0,   9,  15,  71,  74],
+             [0,  0,  88,  29, 147,  89],
+             [0,  0, 158,  10, 218,  68],
+             [0,  0,  15,  89,  74, 150],
+             [0,  0,   0, 159,  47, 225],
+             [0,  0,  52, 177, 111, 230],
+             [0,  0,  83, 112, 147, 171],
+             [0,  0, 152,  83, 214, 139],
+             [0,  0, 128, 181, 196, 241],
+             [0,  0, 186, 147, 249, 205]]
+    len = len(label)
+    label = torch.Tensor(label * 8).reshape(8, len, 6)
+    block_kwargs = {}
+
+    d2 = Discriminator2()
+    d = Discriminator(256, 1)
+    x = d2(img, label, **block_kwargs)
+    x2 = d(img, **block_kwargs)
+    y = torch.nn.functional.softplus(-(x+x2))
+    #y2 = torch.nn.functional.softplus(-x2)
+    print(x)
+    print(y)
+    print(x2)
+    # print(y2)

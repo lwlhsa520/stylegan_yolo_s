@@ -17,6 +17,8 @@ import psutil
 import PIL.Image
 import numpy as np
 import torch
+from cv2 import cv2
+
 import dnnlib
 from models.yolo import Model
 from torch_utils import misc
@@ -28,7 +30,7 @@ import legacy
 from metrics import metric_main
 
 #----------------------------------------------------------------------------
-from utils.general import labels_to_class_weights, intersect_dicts
+from utils.general import labels_to_class_weights, intersect_dicts, xywh2xyxy
 from utils.torch_utils import de_parallel
 
 ROOT = Path(__file__).resolve().parents[0]
@@ -42,26 +44,24 @@ def label_preparetion(labels, nums = 256):
             label = torch.cat([label, tmp], dim=0)
 
         new_bbox.append(label[:nums, 1:])
-        # new_label.append(label[:, 1:2])
 
     return np.stack(new_bbox)
 
 
-def generate_labels(batch_size= 8, nums = 256):
-    batches = np.random.randint(5, 120, batch_size)
+def generate_labels(batch_size=8, seed=0, nums = 256):
     new_labels = []
-    for idx, batch in enumerate(batches):
-        coods = np.random.choice(np.linspace(0.05, 0.95, 100), 2*batch).reshape(batch, 2)
-        shape = np.random.choice(np.linspace(0.05, 0.25, batch), batch).reshape(batch, 1).repeat(2, 1)
-        sub = np.where((coods+shape)>1, coods+shape-1, 0)
-        shape = shape - sub
-        type = np.ones([batch, 2], dtype=float)
-        type[:, 0] = idx
-        label = np.concatenate([type, coods, shape], -1)
-        new_labels.append(torch.from_numpy(label))
+    np.random.seed(seed)
+    for idx in range(batch_size):
+        rnd = np.random.randint(20, 40)
+        rnd_level = np.random.choice(np.linspace(1, 4, 31), 1)
+        batch = int(800 / (rnd_level * rnd))
+        init_ = np.random.choice(np.linspace(20, 200, 181), batch * 2).reshape(batch, 2) / 255
+        shape_ = (np.random.choice(np.linspace(-3, 3, 7), batch * 2).reshape(batch, 2) + rnd) / 255
+        head_ = np.zeros([batch, 2])
+        head_[:, 0] = idx
+        new_labels.append(torch.from_numpy(np.concatenate([head_, init_, shape_], -1)))
 
     return new_labels
-
 
 
 def setup_snapshot_image_grid(training_set, random_seed=0):
@@ -98,6 +98,21 @@ def save_image_grid(img, fname, drange, grid_size):
         PIL.Image.fromarray(img[:, :, 0], 'L').save(fname)
     if C == 3:
         PIL.Image.fromarray(img, 'RGB').save(fname)
+
+#----------------------------------------------------------------------------
+
+def plot(label, batch, run_dir):
+    print("generate groundTrue bbox...")
+    gt_img = np.ones([batch, 256, 258, 3]) * 255
+    gt_img[:, :, 257:, ] = 0
+    for idx, bboxs in enumerate(label):
+        for bbox in bboxs:
+            (x, y, w, h) = bbox[2:] * 255
+            x1, y1, x2, y2 = int(x-w/2), int(y-h/2), int(x+w/2), int(y+h/2)
+            cv2.rectangle(gt_img[idx], (x1,y1),(x2,y2), (255, 0, 255), 2)
+
+    gt_img = np.concatenate(gt_img, 1)
+    cv2.imwrite(run_dir, gt_img)
 
 #----------------------------------------------------------------------------
 
@@ -166,6 +181,7 @@ def training_loop(
 
         print()
 
+
     # Construct networks.
     if rank == 0:
         print('Constructing networks...')
@@ -203,9 +219,15 @@ def training_loop(
             misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
 
     # Print network summary tables.
+    _label = generate_labels(batch_gpu, seed=int(time.time() % 20))
+
+    plot(_label, batch_gpu, os.path.join(run_dir, 'gt_label_init.png'))
+
+    gen_yolo_label = torch.cat(_label).to(device)
+    gen_label = torch.from_numpy(label_preparetion(_label)).to(device)
     if rank == 0:
         z = torch.empty([batch_gpu, G.z_dim], device=device)
-        img = misc.print_module_summary(G, [z])
+        img = misc.print_module_summary(G, [z, gen_label])
         misc.print_module_summary(D, [img])
 
     # Setup augmentation.
@@ -223,7 +245,7 @@ def training_loop(
     if rank == 0:
         print(f'Distributing across {num_gpus} GPUs...')
     ddp_modules = dict()
-    for name, module in [('G_mapping', G.mapping), ('G_synthesis', G.synthesis), ('D', D), ('Y', Y), (None, G_ema), ('augment_pipe', augment_pipe)]:
+    for name, module in [('G_mapping', G.mapping), ('G_conditions', G.conditions),  ('G_synthesis', G.synthesis), ('D', D), ('Y', Y), (None, G_ema), ('augment_pipe', augment_pipe)]:
         if (num_gpus > 1) and (module is not None) and len(list(module.parameters())) != 0:
             module.requires_grad_(True)
             module = torch.nn.parallel.DistributedDataParallel(module, device_ids=[device], broadcast_buffers=False)
@@ -258,14 +280,16 @@ def training_loop(
     # Export sample images.
     grid_size = None
     grid_z = None
-    grid_c = None
+    grid_labels = None
     if rank == 0:
         print('Exporting sample images...')
         grid_size, old_images, aug_images, labels, paths, shapes = setup_snapshot_image_grid(training_set=training_set)
         save_image_grid(old_images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
         save_image_grid(aug_images, os.path.join(run_dir, 'reals_aug.png'), drange=[0,255], grid_size=grid_size)
         grid_z = torch.randn([old_images.shape[0], G.z_dim], device=device).split(batch_gpu)
-        images = torch.cat([G_ema(z=z, noise_mode='const').cpu() for z in grid_z]).numpy()
+        grid_labels = torch.from_numpy(label_preparetion(labels)).to(device)
+        grid_labels = grid_labels.split(batch_gpu)
+        images = torch.cat([G_ema(z=z, bbox=label, noise_mode='const').cpu() for z, label in zip(grid_z, grid_labels)]).numpy()
         save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
 
     # Initialize logs.
@@ -316,8 +340,6 @@ def training_loop(
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
             all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]
 
-            phase_gen_label = torch.from_numpy(label_preparetion(generate_labels(batch_size=batch_size))).to(device)
-            phase_gen_label = phase_gen_label.split(batch_gpu)
 
         # Execute training phases.
         for phase, phase_gen_z in zip(phases, all_gen_z):
@@ -331,10 +353,10 @@ def training_loop(
             phase.module.requires_grad_(True)
 
             # Accumulate gradients over multiple rounds.
-            for round_idx, (real_img,  real_label,  gen_z, gen_label) in enumerate(zip(phase_real_oimg, phase_real_label, phase_gen_z, phase_gen_label)):
+            for round_idx, (real_img,  real_label,  gen_z) in enumerate(zip(phase_real_oimg, phase_real_label, phase_gen_z)):
                 sync = (round_idx == batch_size // (batch_gpu * num_gpus) - 1)
                 gain = phase.interval
-                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_label=real_label, real_olabel=phase_real_olabel, gen_z=gen_z, gen_label=gen_label, sync=sync, gain=gain)
+                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_label=real_label, real_olabel=phase_real_olabel, gen_z=gen_z, gen_label=gen_label, gen_olabel=gen_yolo_label, sync=sync, gain=gain)
 
             # Update weights.
             phase.module.requires_grad_(False)
@@ -399,7 +421,7 @@ def training_loop(
 
         # Save image snapshot.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            images = torch.cat([G_ema(z=z, noise_mode='const').cpu() for z in grid_z]).numpy()
+            images = torch.cat([G_ema(z=z, bbox=label, noise_mode='const').cpu() for z, label in zip(grid_z, grid_labels)]).numpy()
             save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
 
         # Save network snapshot.
